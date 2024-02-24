@@ -108,8 +108,9 @@ defmodule Horde.Process do
     wait_max = Keyword.get(opts, :wait_max, 5)
 
     quote do
-      import Horde.Process
+      use GenServer
 
+      import Horde.Process
       @behaviour Horde.Process
 
       @doc """
