@@ -69,6 +69,16 @@ defmodule Horde.Process do
   You can then implement `handle_call/3` and `handle_cast/2` as you would with any other `GenServer` module. You may either invoke these directly or use the imported functions provided by `Horde.Process`, e.g. `MyApp.User.Process.call!/2`.
   """
 
+  @typedoc """
+  Represents a module that uses `Horde.Process`.
+  """
+  @type horde_process :: Module.t()
+
+  @typedoc """
+  Any term that will be passed to `process_id/1` to generate a unique process identifier.
+  """
+  @type ident :: term()
+
   @doc """
   Given an arbitrary argument, return a unique process identifier. This will, among other things, be used to register the process with a Horde Registry.
   """
@@ -97,9 +107,14 @@ defmodule Horde.Process do
 
   ## Wait Options
 
-  The `:wait_*` options are used by `wait_for_init/2` to determine how long to wait for a process to be registered before giving up and returning `{:error, :not_found}`. Since the registry is eventually consistent, it's possible to fetch a process that can't be started because it's already in the middle of starting, but also which has not yet been added to (or replicated by) the Horde Registry. This is a common scenario when using `start/1` and/or `fetch/1` at the same time from different nodes in a distributed system.
+  The `:wait_*` options are used by a generated function `wait_for_init/2`. They tell the function:
 
-  The maximum amount of time that `wait_for_init/2` will wait before failing is `wait_sleep * wait_max` milliseconds, which defaults to 500 milliseconds. If your application is creating and registering processes quickly, you can try decreasing `:wait_sleep` while increasing `:wait_max`; this means retries will happen more frequently. If, however, you application is creating and registering processes slowly, you can try increasing `:wait_sleep` to avoid unnecessary retries. If you prefer to fail quickly when a process is not registered, you can decrease `:wait_max` to a lower number.
+  1. How long to wait between attempts to fetch a process from the registry.
+  2. The maximum number of attempts to fetch a process from the registry.
+
+  If the maximum number of attempts has been reached without fetching a PID, `wait_for_init/2` will return `{:error, :not_found}`. Since the registry is eventually consistent, it's possible to fetch a process that can't be started because it's already in the middle of starting, but also which has not yet been added to the Horde Registry. This is a common scenario when using `start/1` and/or `fetch/1` at the same time from different nodes in a distributed system.
+
+  In systems with a high degree of concurrency per unique process, there is a greater chance that some amount of waiting will be necessary. The default values are set to be conservative, but you may need to adjust them based on your application's needs. For example, if you have a high degree of concurrency then it might make sense to increase `:wait_max` to a higher number. If you can afford to have processes wait longer before timing out, you might increase `:wait_sleep` to a higher number. If you prefer to "fail fast" when processes can't start (maybe you have an external message queue that can replay messages safely), you might decrease `:wait_max` to a lower number. You will likely need to just play around with these values to find what works best for your application.
   """
   defmacro __using__(opts) do
     supervisor = Keyword.fetch!(opts, :supervisor)
@@ -110,21 +125,10 @@ defmodule Horde.Process do
     quote do
       use GenServer
 
-      import Horde.Process
       @behaviour Horde.Process
 
-      @doc """
-      Starts and monitors a new Horde Process via `GenServer.start_link/3`. If the unique process id extracted from `term` is already in use, this will return `:ignore`.
-
-      The `term` argument will be passed as-is to `init/1`. It will also be passed through `via_tuple/1` to create an appropriate `{:via, _, _}` registry tuple to be passed as the `:name` option in `GenServer.start_link/3`.
-      """
-      def start_link(term) do
-        case GenServer.start_link(__MODULE__, term, name: via_tuple(term)) do
-          {:ok, pid} -> {:ok, pid}
-          {:error, {:already_started, _}} -> :ignore
-          error -> error
-        end
-      end
+      @doc false
+      def start_link(term), do: Horde.Process.start_link(__MODULE__, term, via_tuple(term))
 
       @doc """
       Starts a new Horde Process. This is *not* the same as `GenServer.start`, but rather an entry point to Horde's dynamic supervisor.
@@ -148,20 +152,11 @@ defmodule Horde.Process do
       def via_tuple(term), do: {:via, Horde.Registry, {unquote(registry), process_id(term)}}
 
       @doc """
-      Returns the PID of a Horde Process by its unique process id. If no such process is registered, this will return `nil`.
-      """
-      @spec fetch(term()) :: pid() | nil
-      def fetch(term) do
-        case Horde.Registry.lookup(unquote(registry), process_id(term)) do
-          [{pid, _}] -> pid
-          [] -> nil
-        end
-      end
+      Attempts to fetch the PID of an existing process. If no such process exists in the registry (i.e. `fetch/1` returns nil), an attempt will be made to start a new Horde Process and return that PID.
 
-      @doc """
-      Similar to `fetch/1` but will attempt to start a new Horde Process if one is not already running.
+      The maximum amount of time this function can take to return is determined by the "Wait Options" specified via the `__using__/1` macro. If no existing process is in the registry and no new process can be started within the configured time, this function will return `{:error, :not_found}`.
 
-      The maximum amount of time this function can take to return is determined by the "Wait Options" when using `use Horde.Process`. If the process is not registered within that time, this will return `{:error, :not_found}`.
+      *Note*: It's possible for some *other* error to be returned as well. This function only matches on `{:ok, pid}` and `:ignore`; any other value will be returned to the caller.
       """
       @spec get(term()) :: {:ok, pid()} | {:error, term()}
       def get(term) do
@@ -169,7 +164,7 @@ defmodule Horde.Process do
           nil ->
             case start(term) do
               :ignore ->
-                wait_for_init(term, 1)
+                Horde.Process.wait_for_init(unquote(registry), process_id(term), 1, unquote(wait_sleep), unquote(wait_max))
 
               res ->
                 res
@@ -180,89 +175,138 @@ defmodule Horde.Process do
         end
       end
 
-      @doc """
-      A simple recursive function that will attempt to fetch a PID for a given term, waiting a short period of time between attempts.
+      @doc false
+      def fetch(term), do: Horde.Process.fetch(unquote(registry), process_id(term))
 
-      It's possible to fail to fetch a PID as well as get an `:ignore` response if the child process has not completed `init/1`. To understand why, we need to look at how Horde starts and registers processes. Let's assume that we are using `get/1` to either fetch the PID of an existing process or start a new process.
+      @doc false
+      def call(term, message), do: Horde.Process.call(__MODULE__, term, message)
 
-      1. We use the `process_id/1` function to determine a unique identifier for the process.
-      2. Horde attempts to look up that identifier in the registry. If not found, it moves on to the next step.
-      3. Horde uses DeltaCRDT to determine which node that identifier is associated with.
-      4. Horde sends a `start_link` RPC payload to the remote node to start a new process.
-      5. Once the `init/1` function has completed, Horde receives the PID and adds it to the registry.
+      @doc false
+      def call!(term, message), do: Horde.Process.call!(__MODULE__, term, message)
 
-      The above assumes that the process on the remote node is not already being initialized. If `init/1` hasn't completed yet, or the registry hasn't completed replication to the local node, the RPC payload will return `:ignore`. This is because the remote node is aware that the unique process name is already in use even if the local node doesn't have access to that information yet. Therefore, you cannot fetch the PID because it's not in the registry yet, but you also can't start the process because it's already in the process of being started. This is why using `{:continue, term}` in the `init/1` function is crucial to ensure the process is started and registered as quickly as possible.
+      @doc false
+      def cast(term, message), do: Horde.Process.cast(__MODULE__, term, message)
 
-      However, even if `init/1` does practically no work, it's still possible for applications with a high degree of concurrency to try to access the same unique process at the same time. To work around this, `wait_for_init/2` will sleep for a short period of time between `fetch/1` calls to see if the remote process can finish its init phase and be added to the registry. If the process is not registered within the configured amount of attempts, `wait_for_init/2` will return `{:error, :not_found}`.
-      """
-      def wait_for_init(term, attempt) when attempt <= unquote(wait_max) do
-        case fetch(term) do
-          nil ->
-            Process.sleep(unquote(wait_sleep))
-            wait_for_init(term, attempt + 1)
+      @doc false
+      def cast!(term, message), do: Horde.Process.cast!(__MODULE__, term, message)
 
-          pid ->
-            {:ok, pid}
-        end
-      end
-
-      def wait_for_init(_, _), do: {:error, :not_found}
-
-      @doc """
-      Attempts to invoke `GenServer.call/2` on a Horde Process.
-
-      If no registered process exists, this will return `{:error, :not_found}`. If the process does exist, `{:ok, response}` is returned, where `response` is the response from `GenServer.call/2`.
-
-      *Note*: Because of how this function wraps the response of `GenServer.call/2`, it's possible to get a result tuple that looks like the following:
-
-          {:ok, {:error, :invalid}}
-
-      Because the first element of the tuple is `:ok`, that means a valid process was found and received the message. The second element, `{:error, :invalid}`, is the response from the process. If you match on the result of this function, be sure to match on both the first and second elements separately.
-      """
-      def call(term, message) do
-        case fetch(term) do
-          nil ->
-            {:error, :not_found}
-
-          pid ->
-            {:ok, GenServer.call(pid, message)}
-        end
-      end
-
-      @doc """
-      Executes `GenServer.call/2` on a Horde Process, starting a new process if necessary.
-
-      If the process is not running and cannot be started, this function will result in an exception.
-      """
-      def call!(term, message) do
-        {:ok, pid} = get(term)
-        GenServer.call(pid, message)
-      end
-
-      @doc """
-      Attempts to invoke `GenServer.cast/2` on a Horde Process.
-
-      If no registered process exists, this will return `nil`. Otherwise, it will return `:ok`.
-      """
-      def cast(term, message) do
-        case fetch(term) do
-          nil ->
-            nil
-
-          pid ->
-            GenServer.cast(pid, message)
-        end
-      end
-
-      @doc """
-      Executes `GenServer.cast/2` on a Horde Process, starting a new process if necessary.
-
-      If the process is not running and cannot be started, this function will result in an exception.
-      """
-      def cast!(term, message) do
-        {:ok, pid} = get(term)
-        GenServer.cast(pid, message)
-      end
+      defoverridable [start_link: 1]
     end
+  end
+
+  @doc """
+  Starts and monitors a new Horde Process (`module`) via `GenServer.start_link/3`. If `name` is already in use, this will return `:ignore`.
+  """
+  def start_link(module, term, name) do
+    case GenServer.start_link(module, term, name: name) do
+      {:ok, pid} -> {:ok, pid}
+      {:error, {:already_started, _}} -> :ignore
+      error -> error
+    end
+  end
+
+  @doc """
+  Returns the PID from a Horde Registry using the unique process id. If no such process is registered, this will return `nil`.
+  """
+  @spec fetch(atom(), term()) :: pid() | nil
+  def fetch(registry, id) do
+    case Horde.Registry.lookup(registry, id) do
+      [{pid, _}] -> pid
+      [] -> nil
+    end
+  end
+
+  @doc """
+  A simple recursive function that will attempt to fetch a PID from a Horde Registry, waiting a short period of time between attempts.
+
+  It's possible to fail to fetch a PID as well as get an `:ignore` response if the child process has not finished initialization yet. To understand why, we need to look at how Horde starts and registers processes.
+
+  1. We use the `process_id/1` callback to determine a unique identifier for the process.
+  2. Horde attempts to look up that identifier in the registry. If not found, it moves on to the next step.
+  3. Horde uses DeltaCRDT to determine which node that identifier is associated with. The same identifier will always be associated with the same node in the same cluster topology.
+  4. Horde sends a `start_link/1` RPC payload to the remote node to start a new process.
+  5. Once the `init/1` function has completed, Horde receives the PID and adds it to the registry.
+  6. The local registry is updated immediately but the distributed registry is eventually consistent.
+
+  Steps 5 and 6 are where the problem lies. If `init/1` hasn't completed, or the registry of a remote node has not been made consistent with the recent state of processes, then the local node will return `nil` on a fetch PID call but will also return `:ignore` on a start process call. There are only two ways to handle this scenario:
+
+  1. Give up. Totally reasonable if you don't *need* to have access to the process immediately.
+  2. Wait a bit and try again, possibly a few times before giving up. But then there's a danger of causing a message inbox to fill up while it waits for a remote process to start.
+
+  If the first solution works, simply pass zero for the `wait_max` argument and any `attempt` value greater than zero will cause `{:error, :not_found}` to be returned. If the second solution works, pass a greater-than-zero integer value for `wait_max` and a non-negative integer value for `wait_sleep`. The maximum amount of time this function might take to return to the caller is approximately `wait_max * wait_sleep` milliseconds.
+
+  This is why it is recommended to use `{:continue, :init, state}` in the `init/1` callback and move all non-trivial initialization to `handle_continue/2`. This way, the process can be started and registered as quickly as possible, reducing how long we might sit in `wait_for_init` before getting a pid or returning an error.
+  """
+  def wait_for_init(registry, id, attempt, wait_sleep, wait_max) when attempt <= wait_max do
+    case fetch(registry, id) do
+      nil ->
+        Process.sleep(wait_sleep)
+        wait_for_init(registry, id, attempt + 1, wait_sleep, wait_max)
+
+      pid ->
+        {:ok, pid}
+    end
+  end
+
+  def wait_for_init(_, _), do: {:error, :not_found}
+
+  @doc """
+  Attempts to invoke `GenServer.call/2` on a Horde Process.
+
+  If no registered process exists, this will return `{:error, :not_found}`. If the process does exist, `{:ok, response}` is returned, where `response` is the response from `GenServer.call/2`.
+
+  *Note*: Because of how this function wraps the response of `GenServer.call/2`, it's possible to get a result tuple that looks like the following:
+
+      {:ok, {:error, err}}
+
+  Because the first element of the tuple is `:ok`, that means a valid process was found and received the message. The second element, `{:error, :invalid}`, is the response from the process.
+  """
+  @spec call(horde_process(), ident(), term(), timeout()) :: {:ok, term()} | {:error, term()}
+  def call(module, term, message, timeout \\ 5000) do
+    case module.fetch(term) do
+      nil ->
+        {:error, :not_found}
+
+      pid ->
+        {:ok, GenServer.call(pid, message, timeout)}
+    end
+  end
+
+  @doc """
+  Executes `GenServer.call/2` on a Horde Process, starting a new process if necessary.
+
+  If the process is not running and cannot be started, this function will result in an exception.
+  """
+  @spec call(horde_process(), ident(), term(), timeout()) :: term()
+  def call!(module, term, message, timeout \\ 5000) do
+    {:ok, pid} = module.get(module, term)
+    GenServer.call(pid, message, timeout)
+  end
+
+  @doc """
+  Attempts to invoke `GenServer.cast/2` on a Horde Process.
+
+  If no registered process exists, this will return `nil`. Otherwise, it will return `:ok`.
+  """
+  @spec cast(horde_process(), ident(), term()) :: :ok | nil
+  def cast(module, term, message) do
+    case module.fetch(term) do
+      nil ->
+        nil
+
+      pid ->
+        GenServer.cast(pid, message)
+    end
+  end
+
+  @doc """
+  Executes `GenServer.cast/2` on a Horde Process, starting a new process if necessary.
+
+  If the process is not running and cannot be started, this function will result in an exception.
+  """
+  @spec cast!(horde_process(), ident(), term()) :: :ok
+  def cast!(module, term, message) do
+    {:ok, pid} = module.get(term)
+    GenServer.cast(pid, message)
   end
 end
