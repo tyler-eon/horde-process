@@ -279,7 +279,7 @@ defmodule Horde.Process do
   """
   @spec call(horde_process(), ident(), term(), timeout()) :: term()
   def call!(module, term, message, timeout \\ 5000) do
-    {:ok, pid} = module.get(module, term)
+    {:ok, pid} = module.get(term)
     GenServer.call(pid, message, timeout)
   end
 
