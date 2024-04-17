@@ -182,17 +182,65 @@ defmodule Horde.Process do
       @doc false
       def fetch(term), do: Horde.Process.fetch(unquote(registry), process_id(term))
 
-      @doc false
-      def call(term, message), do: Horde.Process.call(__MODULE__, term, message)
+      @doc """
+      Attempts to invoke `GenServer.call/2` on a Horde Process.
 
-      @doc false
-      def call!(term, message), do: Horde.Process.call!(__MODULE__, term, message)
+      If no registered process exists, this will return `{:error, :not_found}`. If the process does exist, `{:ok, response}` is returned, where `response` is the response from `GenServer.call/2`.
 
-      @doc false
-      def cast(term, message), do: Horde.Process.cast(__MODULE__, term, message)
+      *Note*: Because of how this function wraps the response of `GenServer.call/2`, it's possible to get a result tuple that looks like the following:
 
-      @doc false
-      def cast!(term, message), do: Horde.Process.cast!(__MODULE__, term, message)
+          {:ok, {:error, err}}
+
+      Because the first element of the tuple is `:ok`, that means a valid process was found and received the message. The second element, `{:error, :invalid}`, is the response from the process.
+      """
+      @spec call(ident(), term(), timeout()) :: {:ok, term()} | {:error, term()}
+      def call(term, message, timeout \\ 5000) do
+        case fetch(term) do
+          nil ->
+            {:error, :not_found}
+
+          pid ->
+            {:ok, GenServer.call(pid, message, timeout)}
+        end
+      end
+
+      @doc """
+      Executes `GenServer.call/2` on a Horde Process, starting a new process if necessary.
+
+      If the process is not running and cannot be started, this function will result in an exception.
+      """
+      @spec call(ident(), term(), timeout()) :: term()
+      def call!(term, message, timeout \\ 5000) do
+        {:ok, pid} = get(term)
+        GenServer.call(pid, message, timeout)
+      end
+
+      @doc """
+      Attempts to invoke `GenServer.cast/2` on a Horde Process.
+
+      If no registered process exists, this will return `nil`. Otherwise, it will return `:ok`.
+      """
+      @spec cast(ident(), term()) :: :ok | nil
+      def cast(term, message) do
+        case fetch(term) do
+          nil ->
+            nil
+
+          pid ->
+            GenServer.cast(pid, message)
+        end
+      end
+
+      @doc """
+      Executes `GenServer.cast/2` on a Horde Process, starting a new process if necessary.
+
+      If the process is not running and cannot be started, this function will result in an exception.
+      """
+      @spec cast!(ident(), term()) :: :ok
+      def cast!(term, message) do
+        {:ok, pid} = get(term)
+        GenServer.cast(pid, message)
+      end
 
       defoverridable [start_link: 1]
     end
@@ -253,64 +301,4 @@ defmodule Horde.Process do
   end
 
   def wait_for_init(_, _), do: {:error, :not_found}
-
-  @doc """
-  Attempts to invoke `GenServer.call/2` on a Horde Process.
-
-  If no registered process exists, this will return `{:error, :not_found}`. If the process does exist, `{:ok, response}` is returned, where `response` is the response from `GenServer.call/2`.
-
-  *Note*: Because of how this function wraps the response of `GenServer.call/2`, it's possible to get a result tuple that looks like the following:
-
-      {:ok, {:error, err}}
-
-  Because the first element of the tuple is `:ok`, that means a valid process was found and received the message. The second element, `{:error, :invalid}`, is the response from the process.
-  """
-  @spec call(horde_process(), ident(), term(), timeout()) :: {:ok, term()} | {:error, term()}
-  def call(module, term, message, timeout \\ 5000) do
-    case module.fetch(term) do
-      nil ->
-        {:error, :not_found}
-
-      pid ->
-        {:ok, GenServer.call(pid, message, timeout)}
-    end
-  end
-
-  @doc """
-  Executes `GenServer.call/2` on a Horde Process, starting a new process if necessary.
-
-  If the process is not running and cannot be started, this function will result in an exception.
-  """
-  @spec call(horde_process(), ident(), term(), timeout()) :: term()
-  def call!(module, term, message, timeout \\ 5000) do
-    {:ok, pid} = module.get(term)
-    GenServer.call(pid, message, timeout)
-  end
-
-  @doc """
-  Attempts to invoke `GenServer.cast/2` on a Horde Process.
-
-  If no registered process exists, this will return `nil`. Otherwise, it will return `:ok`.
-  """
-  @spec cast(horde_process(), ident(), term()) :: :ok | nil
-  def cast(module, term, message) do
-    case module.fetch(term) do
-      nil ->
-        nil
-
-      pid ->
-        GenServer.cast(pid, message)
-    end
-  end
-
-  @doc """
-  Executes `GenServer.cast/2` on a Horde Process, starting a new process if necessary.
-
-  If the process is not running and cannot be started, this function will result in an exception.
-  """
-  @spec cast!(horde_process(), ident(), term()) :: :ok
-  def cast!(module, term, message) do
-    {:ok, pid} = module.get(term)
-    GenServer.cast(pid, message)
-  end
 end
