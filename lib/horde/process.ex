@@ -164,7 +164,11 @@ defmodule Horde.Process do
           nil ->
             case start(term) do
               :ignore ->
-                Horde.Process.wait_for_init(unquote(registry), process_id(term), 1, unquote(wait_sleep), unquote(wait_max))
+                if unquote(wait_max) > 0 do
+                  Horde.Process.wait_for_init(unquote(registry), process_id(term), 1, unquote(wait_sleep), unquote(wait_max))
+                else
+                  :ignore
+                end
 
               res ->
                 res
