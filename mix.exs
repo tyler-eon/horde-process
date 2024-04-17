@@ -10,7 +10,7 @@ defmodule Horde.Process.MixProject do
       package: package(),
       source_url: "https://github.com/tyler-eon/horde-process",
       homepage_url: "https://github.com/tyler-eon/horde-process",
-      version: "0.3.1",
+      version: "0.4.0",
       elixir: "~> 1.15",
       start_permanent: Mix.env() == :prod,
       deps: deps()
